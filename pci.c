@@ -6,6 +6,8 @@
 
 #include <linux/percpu-defs.h>
 #include <linux/sched/clock.h>
+#include <linux/topology.h>
+#include <linux/mmzone.h>
 
 #include "nvmev.h"
 #include "pci.h"
@@ -390,8 +392,17 @@ static struct pci_bus *__create_pci_bus(void)
 {
 	struct pci_bus *bus = NULL;
 	struct pci_dev *dev;
+	int node;
 
-	nvmev_pci_sysdata.node = cpu_to_node(nvmev_vdev->config.cpu_nr_dispatcher);
+	/* Get NUMA node for dispatcher CPU, ensure it's valid */
+	node = cpu_to_node(nvmev_vdev->config.cpu_nr_dispatcher);
+	if (node < 0 || node >= MAX_NUMNODES || !node_online(node)) {
+		/* Fallback to node 0 if invalid */
+		node = 0;
+		if (!node_online(node))
+			node = NUMA_NO_NODE;
+	}
+	nvmev_pci_sysdata.node = node;
 
 	bus = pci_scan_bus(NVMEV_PCI_BUS_NUM, &nvmev_pci_ops, &nvmev_pci_sysdata);
 
@@ -407,6 +418,14 @@ static struct pci_bus *__create_pci_bus(void)
 
 		nvmev_vdev->pdev = dev;
 		dev->irq = nvmev_vdev->pcihdr->intr.iline;
+		
+		/* Ensure device has valid NUMA node */
+		if (node >= 0 && node < MAX_NUMNODES && node_online(node)) {
+			set_dev_node(&dev->dev, node);
+		} else {
+			set_dev_node(&dev->dev, NUMA_NO_NODE);
+		}
+		
 		__dump_pci_dev(dev);
 
 		__init_nvme_ctrl_regs(dev);
