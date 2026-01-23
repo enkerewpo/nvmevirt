@@ -677,5 +677,6 @@ static void NVMeV_exit(void)
 }
 
 MODULE_LICENSE("GPL v2");
+MODULE_DESCRIPTION("NVMeVirt: A Versatile Software-defined Virtual NVMe Device");
 module_init(NVMeV_init);
 module_exit(NVMeV_exit);

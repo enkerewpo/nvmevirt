@@ -542,11 +542,18 @@ void nvmev_proc_io_cq(int cqid, int new_db, int old_db)
 	struct nvmev_completion_queue *cq = nvmev_vdev->cqes[cqid];
 	int i;
 	for (i = old_db; i != new_db; i++) {
-		int sqid = cq_entry(i).sq_id;
-		if (i >= cq->queue_size) {
-			i = -1;
+		/* Check bounds before accessing cq_entry to prevent out-of-bounds access */
+		if (i < 0 || i >= cq->queue_size) {
+			/* Handle circular queue wrap-around */
+			if (i >= cq->queue_size) {
+				i = -1;
+				continue;
+			}
+			/* If i < 0, something is wrong, but continue to avoid crash */
 			continue;
 		}
+		
+		int sqid = cq_entry(i).sq_id;
 
 		/* Should check the validity here since SPDK deletes SQ immediately
 		 * before processing associated CQes */
