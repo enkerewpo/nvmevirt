@@ -59,6 +59,14 @@ static unsigned int __do_perform_io(int sqid, int sq_entry)
 	size_t nsid = cmd->nsid - 1; // 0-based
 	bool is_paddr_memremap = false;
 
+	/* Only process read/write/zone_append commands */
+	if (cmd->opcode != nvme_cmd_read && 
+	    cmd->opcode != nvme_cmd_write && 
+	    cmd->opcode != nvme_cmd_zone_append) {
+		NVMEV_ERROR("__do_perform_io called for unsupported opcode: 0x%x\n", cmd->opcode);
+		return 0;
+	}
+
 	offset = __cmd_io_offset(cmd);
 	length = __cmd_io_size(cmd);
 	remaining = length;
@@ -72,27 +80,59 @@ static unsigned int __do_perform_io(int sqid, int sq_entry)
 		prp_offs++;
 		if (prp_offs == 1) {
 			paddr = cmd->prp1;
+			/* PRP1 must be valid for read/write/zone_append commands */
+			if (paddr == 0) {
+				NVMEV_ERROR("Invalid PRP1 address: 0x%llx for opcode 0x%x\n", paddr, cmd->opcode);
+				goto cleanup_and_return;
+			}
 		} else if (prp_offs == 2) {
 			paddr = cmd->prp2;
 			if (remaining > PAGE_SIZE) {
+				/* PRP2 must be valid if we need a PRP list */
+				if (paddr == 0) {
+					NVMEV_ERROR("Invalid PRP2 address: 0x%llx for opcode 0x%x\n", paddr, cmd->opcode);
+					goto cleanup_and_return;
+				}
 				if (pfn_valid(paddr >> PAGE_SHIFT)) {
-					paddr_list = kmap_atomic_pfn(PRP_PFN(paddr)) +
-						(paddr & PAGE_OFFSET_MASK);
+					paddr_list = (u64 *)((char *)kmap_atomic_pfn(PRP_PFN(paddr)) +
+						(paddr & PAGE_OFFSET_MASK));
 				} else {
 					paddr_list = memremap(paddr, PAGE_SIZE, MEMREMAP_WT);
-					paddr_list += (paddr & PAGE_OFFSET_MASK);
+					if (!paddr_list) {
+						NVMEV_ERROR("Failed to memremap PRP list at paddr 0x%llx\n", paddr);
+						goto cleanup_and_return;
+					}
+					paddr_list = (u64 *)((char *)paddr_list + (paddr & PAGE_OFFSET_MASK));
 					is_paddr_memremap = true;
 				}
 				paddr = paddr_list[prp2_offs++];
+				/* Validate address from PRP list */
+				if (paddr == 0) {
+					NVMEV_ERROR("Invalid address from PRP list: 0x%llx\n", paddr);
+					goto cleanup_and_return;
+				}
 			}
 		} else {
+			if (!paddr_list) {
+				NVMEV_ERROR("paddr_list is NULL but prp_offs > 2\n");
+				goto cleanup_and_return;
+			}
 			paddr = paddr_list[prp2_offs++];
+			/* Validate address from PRP list */
+			if (paddr == 0) {
+				NVMEV_ERROR("Invalid address from PRP list: 0x%llx\n", paddr);
+				goto cleanup_and_return;
+			}
 		}
 
 		if (pfn_valid(paddr >> PAGE_SHIFT)) {
 			vaddr = kmap_atomic_pfn(PRP_PFN(paddr));
 		} else {
 			vaddr = memremap(paddr, PAGE_SIZE, MEMREMAP_WT);
+			if (!vaddr) {
+				NVMEV_ERROR("Failed to memremap data buffer at paddr 0x%llx\n", paddr);
+				goto cleanup_and_return;
+			}
 			is_vaddr_memremap = true;
 		}
 
@@ -102,6 +142,11 @@ static unsigned int __do_perform_io(int sqid, int sq_entry)
 			mem_offs = paddr & PAGE_OFFSET_MASK;
 			if (io_size + mem_offs > PAGE_SIZE)
 				io_size = PAGE_SIZE - mem_offs;
+		}
+
+		if (!vaddr) {
+			NVMEV_ERROR("vaddr is NULL, cannot perform I/O\n");
+			goto cleanup_and_return;
 		}
 
 		if (cmd->opcode == nvme_cmd_write ||
@@ -124,6 +169,7 @@ static unsigned int __do_perform_io(int sqid, int sq_entry)
 		offset += io_size;
 	}
 
+cleanup_and_return:
 	if (paddr_list) {
 		if (!is_paddr_memremap) 
 			kunmap_atomic(paddr_list);
@@ -132,7 +178,7 @@ static unsigned int __do_perform_io(int sqid, int sq_entry)
 	}
 	paddr_list = NULL;
 
-	return length;
+	return length - remaining;
 }
 
 static u64 paddr_list[513] = {
@@ -153,6 +199,14 @@ static unsigned int __do_perform_io_using_dma(int sqid, int sq_entry)
 	size_t mem_offs = 0;
 	bool is_memremap = false;
 
+	/* Only process read/write/zone_append commands */
+	if (cmd->opcode != nvme_cmd_read && 
+	    cmd->opcode != nvme_cmd_write && 
+	    cmd->opcode != nvme_cmd_zone_append) {
+		NVMEV_ERROR("__do_perform_io_using_dma called for unsupported opcode: 0x%x\n", cmd->opcode);
+		return 0;
+	}
+
 	offset = __cmd_io_offset(cmd);
 	length = __cmd_io_size(cmd);
 	remaining = length;
@@ -165,21 +219,49 @@ static unsigned int __do_perform_io_using_dma(int sqid, int sq_entry)
 		prp_offs++;
 		if (prp_offs == 1) {
 			paddr_list[prp_offs] = cmd->prp1;
+			/* PRP1 must be valid for read/write/zone_append commands */
+			if (paddr_list[prp_offs] == 0) {
+				NVMEV_ERROR("Invalid PRP1 address: 0x%llx for opcode 0x%x\n", paddr_list[prp_offs], cmd->opcode);
+				goto cleanup_dma_and_return;
+			}
 		} else if (prp_offs == 2) {
 			paddr_list[prp_offs] = cmd->prp2;
 			if (remaining > PAGE_SIZE) {
+				/* PRP2 must be valid if we need a PRP list */
+				if (paddr_list[prp_offs] == 0) {
+					NVMEV_ERROR("Invalid PRP2 address: 0x%llx for opcode 0x%x\n", paddr_list[prp_offs], cmd->opcode);
+					goto cleanup_dma_and_return;
+				}
 				if (pfn_valid(paddr_list[prp_offs] >> PAGE_SHIFT)) {
- 					tmp_paddr_list = kmap_atomic_pfn(PRP_PFN(paddr_list[prp_offs])) + 
-							(paddr_list[prp_offs] & PAGE_OFFSET_MASK);
+ 					tmp_paddr_list = (u64 *)((char *)kmap_atomic_pfn(PRP_PFN(paddr_list[prp_offs])) + 
+							(paddr_list[prp_offs] & PAGE_OFFSET_MASK));
  				} else {
  					tmp_paddr_list = memremap(paddr_list[prp_offs], PAGE_SIZE, MEMREMAP_WT);
- 					tmp_paddr_list += (paddr_list[prp_offs] & PAGE_OFFSET_MASK);
+					if (!tmp_paddr_list) {
+						NVMEV_ERROR("Failed to memremap PRP list at paddr 0x%llx\n", paddr_list[prp_offs]);
+						goto cleanup_dma_and_return;
+					}
+ 					tmp_paddr_list = (u64 *)((char *)tmp_paddr_list + (paddr_list[prp_offs] & PAGE_OFFSET_MASK));
  					is_memremap = true;
  				}
 				paddr_list[prp_offs] = tmp_paddr_list[prp2_offs++];
+				/* Validate address from PRP list */
+				if (paddr_list[prp_offs] == 0) {
+					NVMEV_ERROR("Invalid address from PRP list: 0x%llx\n", paddr_list[prp_offs]);
+					goto cleanup_dma_and_return;
+				}
 			}
 		} else {
+			if (!tmp_paddr_list) {
+				NVMEV_ERROR("tmp_paddr_list is NULL but prp_offs > 2\n");
+				goto cleanup_dma_and_return;
+			}
 			paddr_list[prp_offs] = tmp_paddr_list[prp2_offs++];
+			/* Validate address from PRP list */
+			if (paddr_list[prp_offs] == 0) {
+				NVMEV_ERROR("Invalid address from PRP list: 0x%llx\n", paddr_list[prp_offs]);
+				goto cleanup_dma_and_return;
+			}
 		}
 
 		io_size = min_t(size_t, remaining, PAGE_SIZE);
@@ -200,6 +282,22 @@ static unsigned int __do_perform_io_using_dma(int sqid, int sq_entry)
  		memunmap(tmp_paddr_list);
  		is_memremap = false;
  	}
+	tmp_paddr_list = NULL;
+
+cleanup_dma_and_return:
+	if (tmp_paddr_list != NULL) {
+		if (!is_memremap) {
+			kunmap_atomic(tmp_paddr_list);
+		} else {
+			memunmap(tmp_paddr_list);
+		}
+		tmp_paddr_list = NULL;
+	}
+	
+	/* If error occurred during PRP list collection, return 0 */
+	if (num_prps == 0 || remaining == length) {
+		return 0;
+	}
 
 	remaining = length;
 	prp_offs = 1;

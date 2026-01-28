@@ -191,8 +191,28 @@ static void __nvmev_admin_get_log_page(int eid)
 	struct nvme_get_log_page_command *cmd = &sq_entry(eid).get_log_page;
 	void *page;
 	uint32_t len = ((((uint32_t)cmd->numdu << 16) | cmd->numdl) + 1) << 2;
+	bool is_memremap = false;
 
-	page = prp_address(cmd->prp1);
+	if (cmd->prp1 == 0) {
+		NVMEV_ERROR("Invalid PRP1 address: 0x%llx\n", cmd->prp1);
+		__make_cq_entry(eid, NVME_SC_INVALID_FIELD);
+		return;
+	}
+
+	/* Use safe version that handles both valid PFN and memremap cases */
+	if (pfn_valid(cmd->prp1 >> PAGE_SHIFT)) {
+		page = prp_address(cmd->prp1);
+		is_memremap = false;
+	} else {
+		page = memremap(cmd->prp1, len, MEMREMAP_WT);
+		is_memremap = true;
+	}
+	
+	if (!page) {
+		NVMEV_ERROR("Failed to map PRP1 address: 0x%llx\n", cmd->prp1);
+		__make_cq_entry(eid, NVME_SC_INVALID_FIELD);
+		return;
+	}
 
 	switch (cmd->lid) {
 	case NVME_LOG_SMART: {
@@ -206,7 +226,7 @@ static void __nvmev_admin_get_log_page(int eid)
 			.temperature[1] = (0 >> 8) & 0xff,
 		};
 
-		__memcpy(page, &smart_log, len);
+		memcpy(page, &smart_log, len);
 		break;
 	}
 	case NVME_LOG_CMD_EFFECTS: {
@@ -236,7 +256,7 @@ static void __nvmev_admin_get_log_page(int eid)
 			.resv = { 0, },
 		};
 
-		__memcpy(page, &effects_log, len);
+		memcpy(page, &effects_log, len);
 		break;
 	}
 	default:
@@ -252,8 +272,13 @@ static void __nvmev_admin_get_log_page(int eid)
 		 */
 		NVMEV_ERROR("Unimplemented log page identifier: 0x%hhx,"
 			    "the system will be unstable!\n", cmd->lid);
-		__memset(page, 0, len);
+		memset(page, 0, len);
 		break;
+	}
+
+	/* Unmap if we used memremap */
+	if (is_memremap && page) {
+		memunmap(page);
 	}
 
 	__make_cq_entry(eid, NVME_SC_SUCCESS);
