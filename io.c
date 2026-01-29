@@ -733,22 +733,34 @@ static int nvmev_io_worker(void *data)
 #endif
 				if (w->is_internal) {
 					;
-				} else if (io_using_dma) {
-					__do_perform_io_using_dma(w->sqid, w->sq_entry);
 				} else {
-#if (BASE_SSD == KV_PROTOTYPE)
-					struct nvmev_submission_queue *sq =
-						nvmev_vdev->sqes[w->sqid];
-					ns = &nvmev_vdev->ns[0];
-					if (ns->identify_io_cmd(ns, sq_entry(w->sq_entry))) {
-						w->result0 = ns->perform_io_cmd(
-							ns, &sq_entry(w->sq_entry), &(w->status));
+					// Check if this command requires data copy
+					// Zone management and flush commands don't need data copy
+					struct nvmev_submission_queue *sq = nvmev_vdev->sqes[w->sqid];
+					u8 opcode = sq_entry(w->sq_entry).common.opcode;
+					bool needs_data_copy = (opcode == nvme_cmd_read ||
+								  opcode == nvme_cmd_write ||
+								  opcode == nvme_cmd_zone_append);
+					
+					if (!needs_data_copy) {
+						// Commands like zone management, flush don't need data copy
+						// They are already processed by proc_io_cmd, just mark as copied
+						;
+					} else if (io_using_dma) {
+						__do_perform_io_using_dma(w->sqid, w->sq_entry);
 					} else {
-						__do_perform_io(w->sqid, w->sq_entry);
-					}
+#if (BASE_SSD == KV_PROTOTYPE)
+						ns = &nvmev_vdev->ns[0];
+						if (ns->identify_io_cmd(ns, sq_entry(w->sq_entry))) {
+							w->result0 = ns->perform_io_cmd(
+								ns, &sq_entry(w->sq_entry), &(w->status));
+						} else {
+							__do_perform_io(w->sqid, w->sq_entry);
+						}
 #else 
-					__do_perform_io(w->sqid, w->sq_entry);
+						__do_perform_io(w->sqid, w->sq_entry);
 #endif
+					}
 				}
 
 #ifdef PERF_DEBUG
